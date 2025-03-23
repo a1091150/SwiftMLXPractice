@@ -6,6 +6,7 @@
 //
 
 import Foundation
-simpleLinearExample()
 print("Hello, World!")
 
+//simpleLinearExample()
+try await mnistExample()
