@@ -36,10 +36,33 @@ fileprivate func readTokenizerData() throws -> Config? {
     return nil
 }
 
+fileprivate func readMLModel() throws -> MLModel {
+    let path = URL.documentsDirectory.appending(
+        path: "mlx_project/llama-to-coreml/model.mlmodelc",
+        directoryHint: .notDirectory)
+    print(path)
+    return try MLModel(contentsOf: path)
+}
+
 func llamaRun() throws{
     let tConfig = try readConfigJson()!
     let tData = try readTokenizerData()!
     let tokenizer = try PreTrainedTokenizer(tokenizerConfig: tConfig, tokenizerData: tData)
-    let tokens = tokenizer.encode(text: "123")
-    print(tokens)
+    let tokens = tokenizer.encode(text: "介紹你自己")
+    
+    let mlArray = try MLMultiArray(tokens)
+//    let mlArray = try MLMultiArray(shape: [tokens.count as NSNumber], dataType: .int32)
+//    for (index, value) in tokens.enumerated() {
+//        mlArray[index]
+//    }
+    
+    let model = try readMLModel()
+    let inputDict = try MLDictionaryFeatureProvider(dictionary: ["inputIds": mlArray])
+    let prediction = try model.prediction(from: inputDict)
+    print(prediction.featureNames)
+    for name in prediction.featureNames {
+        if  let resultArray = prediction.featureValue(for: name) {
+            print(resultArray)
+        }
+    }
 }
