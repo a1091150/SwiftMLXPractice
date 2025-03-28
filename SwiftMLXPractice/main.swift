@@ -12,7 +12,7 @@ print("Hello, World!")
 //simpleLinearExample()
 //try await mnistExample()
 do {
-    try llamaRun()
+    try await llamaRun()
 }catch {
     print(error)
 }

@@ -10,6 +10,8 @@ import Tokenizers
 import Jinja
 import MLX
 import CoreML
+import Models
+import Generation
 
 fileprivate let baseUrl: URL = {
     return URL.homeDirectory
@@ -40,29 +42,118 @@ fileprivate func readMLModel() throws -> MLModel {
     let path = URL.documentsDirectory.appending(
         path: "mlx_project/llama-to-coreml/model.mlmodelc",
         directoryHint: .notDirectory)
-    print(path)
-    return try MLModel(contentsOf: path)
+    
+    let config = MLModelConfiguration()
+    config.computeUnits = .cpuAndGPU
+    let model = try MLModel(contentsOf: path, configuration: config)
+    return model
 }
 
-func llamaRun() throws{
+fileprivate enum Keys {
+    // Input keys
+    static let inputIds = "inputIds"
+    static let attentionMask = "attentionMask"
+    static let causalMask = "causalMask"
+    static let keyCache = "keyCache"
+    static let valueCache = "valueCache"
+    // Output keys
+    static let logits = "logits"
+    static let presentKeys = "presentKeys"
+    static let presentValues = "presentValues"
+}
+
+fileprivate func predictNextTokenScores(
+    tokens: MLTensor,
+    config: GenerationConfig,
+    model: MLModel,
+    maxContextLength: Int = 128,
+    isRequiringAttentionMask: Bool = true
+    
+) async throws -> MLTensor {
+    assert(tokens.rank == 2) // [batch, current sequence length]
+    let tokenCount = tokens.shape[1]
+    let padLength = maxContextLength - tokenCount
+    let padding = MLTensor(repeating: Int32(config.padTokenId ?? 0), shape: [1, padLength])
+    let inputIDs = MLTensor(concatenating: [tokens, padding], alongAxis: -1)
+    var inputDictionary = ["inputIds": inputIDs]
+    if  isRequiringAttentionMask {
+        let mask = [Int32](repeating: 1, count: tokenCount) + [Int32](repeating: 0, count: padLength)
+        let attentionMask = MLTensor(shape: inputIDs.shape, scalars: mask)
+        inputDictionary[Keys.causalMask] = attentionMask.reshaped(to: [1, 1] + inputIDs.shape)
+    }
+    let outputs = try await model.prediction(from: inputDictionary)
+    
+    assert(outputs.keys.contains(Keys.logits))
+    let scores = outputs[Keys.logits]!
+    
+    assert(scores.rank == 3)
+    let tokenIndex = tokenCount - 1
+    let nextTokenScores = scores[nil, tokenIndex, nil].expandingShape(at: 0)
+    assert(nextTokenScores.rank == 3)
+    assert(nextTokenScores.shape[0] == 1 && nextTokenScores.shape[1] == 1)
+    return nextTokenScores
+}
+
+func llamaRun() async throws{
     let tConfig = try readConfigJson()!
     let tData = try readTokenizerData()!
     let tokenizer = try PreTrainedTokenizer(tokenizerConfig: tConfig, tokenizerData: tData)
-    let tokens = tokenizer.encode(text: "介紹你自己")
+    let tokens = tokenizer.encode(text: "介紹你自己").map{ Int32($0) }
     
-    let mlArray = try MLMultiArray(tokens)
-//    let mlArray = try MLMultiArray(shape: [tokens.count as NSNumber], dataType: .int32)
-//    for (index, value) in tokens.enumerated() {
-//        mlArray[index]
-//    }
+    var config = GenerationConfig(maxNewTokens: 128)
+    config.eosTokenId = tokenizer.eosTokenId
+    config.bosTokenId = tokenizer.bosTokenId
+    config.maxLength = config.maxNewTokens + 128
+    
     
     let model = try readMLModel()
-    let inputDict = try MLDictionaryFeatureProvider(dictionary: ["inputIds": mlArray])
-    let prediction = try model.prediction(from: inputDict)
-    print(prediction.featureNames)
-    for name in prediction.featureNames {
-        if  let resultArray = prediction.featureValue(for: name) {
-            print(resultArray)
+    
+    // Copy from Generation.swift generation function
+    let batchTokens = tokens.map{$0}
+    var outputTokens = MLTensor(batchTokens).expandingShape(at: 0)
+    while outputTokens.shape[1] < config.maxLength {
+        let nextTokenScores = try await predictNextTokenScores(tokens: outputTokens, config: config, model: model)
+        let nextToken = switch config.generationMode {
+        case .greedy:
+            selectNextTokenUsingGreedyDecoding(from: nextTokenScores)
+        case .sample:
+            selectNextTokenUsingTopKSampling(
+                from: nextTokenScores,
+                temperature: Float(config.temperature),
+                topK: config.topK
+            )
+        default:
+            fatalError("Generation mode \(config.generationMode) not implemented yet")
         }
+        
+        outputTokens = MLTensor(concatenating: [outputTokens, nextToken], alongAxis: -1)
     }
+    
+    let outputTokenInt = await tensorToGenerationOutput(outputTokens)
+    let final = tokenizer.decode(tokens: outputTokenInt)
+    print(final)
+}
+
+private func tensorToGenerationOutput(_ tensor: MLTensor) async -> GenerationOutput {
+    await tensor.shapedArray(of: Int32.self).scalars.map { Int($0) }
+}
+
+// Copy from Generation Decoder.swift
+private func selectNextTokenUsingGreedyDecoding(from scores: MLTensor) -> MLTensor {
+    scores.argmax(alongAxis: -1).reshaped(to: [1, 1])
+}
+
+private func selectNextTokenUsingTopKSampling(from scores: MLTensor, temperature: Float, topK: Int) -> MLTensor {
+    let temperatureAdjustedScores = scores / temperature
+    let (topKScores, topKIndices) = temperatureAdjustedScores.topK(topK)
+    let topKProbs = topKScores.softmax(alongAxis: -1)
+    let rnd = topKProbs.sum() * Float.random(in: 0 ..< 1)
+    var accumTopKProbs = topKProbs.cumulativeSum(alongAxis: -1)
+    accumTopKProbs += (accumTopKProbs .< rnd) * 100.0
+    let topKIndex = accumTopKProbs.argsort()[..., 0]
+    let nextTokenTensor = topKIndices.gathering(
+        atIndices: topKIndex,
+        alongAxis: topKIndices.rank - 1
+    )
+    return nextTokenTensor.reshaped(to: [1, 1])
 }
