@@ -8,7 +8,6 @@
 import Hub
 import Tokenizers
 import Jinja
-import MLX
 import CoreML
 import Models
 import Generation
@@ -67,27 +66,31 @@ fileprivate func predictNextTokenScores(
     config: GenerationConfig,
     model: MLModel,
     maxContextLength: Int = 128,
-    isRequiringAttentionMask: Bool = true
-    
+    isRequiringAttentionMask: Bool = true,
+    state: MLState
 ) async throws -> MLTensor {
     assert(tokens.rank == 2) // [batch, current sequence length]
     let tokenCount = tokens.shape[1]
-    let padLength = maxContextLength - tokenCount
-    let padding = MLTensor(repeating: Int32(config.padTokenId ?? 0), shape: [1, padLength])
-    let inputIDs = MLTensor(concatenating: [tokens, padding], alongAxis: -1)
-    var inputDictionary = ["inputIds": inputIDs]
-    if  isRequiringAttentionMask {
-        let mask = [Int32](repeating: 1, count: tokenCount) + [Int32](repeating: 0, count: padLength)
-        let attentionMask = MLTensor(shape: inputIDs.shape, scalars: mask)
-        inputDictionary[Keys.causalMask] = attentionMask.reshaped(to: [1, 1] + inputIDs.shape)
+    let inputIds = tokens
+    let isRequiringCausalMask = true
+    
+    var inputDictionary = [
+        Keys.inputIds: inputIds
+    ]
+    
+    
+    if  isRequiringCausalMask {
+        let causalMask = MLTensor(zeros: [1, 1, 1, tokenCount + 1], scalarType: Float16.self)
+        inputDictionary[Keys.causalMask] = causalMask
     }
-    let outputs = try await model.prediction(from: inputDictionary)
+    
+    let outputs = try await model.prediction(from: inputDictionary, using: state)
     
     assert(outputs.keys.contains(Keys.logits))
     let scores = outputs[Keys.logits]!
-    
     assert(scores.rank == 3)
-    let tokenIndex = tokenCount - 1
+    
+    let tokenIndex = inputIds.shape[1] - 1
     let nextTokenScores = scores[nil, tokenIndex, nil].expandingShape(at: 0)
     assert(nextTokenScores.rank == 3)
     assert(nextTokenScores.shape[0] == 1 && nextTokenScores.shape[1] == 1)
@@ -107,12 +110,16 @@ func llamaRun() async throws{
     
     
     let model = try readMLModel()
+    // copied from LanguageModelWithStatefulKVCache
+    
+    let state = model.makeState()
     
     // Copy from Generation.swift generation function
     let batchTokens = tokens.map{$0}
     var outputTokens = MLTensor(batchTokens).expandingShape(at: 0)
     while outputTokens.shape[1] < config.maxLength {
-        let nextTokenScores = try await predictNextTokenScores(tokens: outputTokens, config: config, model: model)
+        let nextTokenScores = try await predictNextTokenScores(tokens: outputTokens, config: config,
+                                                               model: model, state: state)
         let nextToken = switch config.generationMode {
         case .greedy:
             selectNextTokenUsingGreedyDecoding(from: nextTokenScores)

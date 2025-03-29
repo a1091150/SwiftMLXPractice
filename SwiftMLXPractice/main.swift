@@ -14,6 +14,7 @@ print("Hello, World!")
 do {
     try await llamaRun()
 }catch {
+    print(error.localizedDescription)
     print(error)
 }
 
